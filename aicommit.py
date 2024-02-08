@@ -125,7 +125,7 @@ def main():
         print("No staged changes found. Make sure there are changes and run `git add .`")
         sys.exit(1)
 
-    if len(diff) > 8000:
+    if len(diff) > 64000:
         print("The diff is too large to process. Please split your changes into smaller commits.")
         sys.exit(1)
 
