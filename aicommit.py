@@ -7,10 +7,10 @@ import google.generativeai as genai
 
 load_dotenv()
 
-OPENAI_API_KEY= ""
+OPENAI_API_KEY= "YOUR_KEY_GOES_HERE"
 OPENAI_MODEL_NAME = "gpt-3.5-turbo-0125"
 
-GOOGLE_API_KEY = '' 
+GOOGLE_API_KEY = "YOUR_KEY_GOES_HERE"
 GEMINI_MODEL_NAME = "gemini-pro"
 
 def get_api_configuration():
