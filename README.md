@@ -34,7 +34,7 @@ def validate_and_format_message(message: str):
 
 ## Usage
 
-To use this script, configure a Git alias as follows:
+To use this script set the API key your model, either `OPENAI_API_KEY` or `GOOGLE_API_KEY`  and save the file `~/.aicommit.py`, install the requirements with `pip install -r requirements` and then configure a Git alias as follows:
 ```bash
 git config --global alias.ai '!git commit -am "$(python ~/.aicommit.py)"'
 ```
