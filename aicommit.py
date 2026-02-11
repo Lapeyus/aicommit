@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import argparse
 import os
 import re
 import sys
 import json
 import subprocess
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 from dotenv import load_dotenv
 
@@ -35,9 +36,51 @@ load_dotenv()
 # ───────────────────────────────────────────────────────────────────────────────
 # Config
 # ───────────────────────────────────────────────────────────────────────────────
-CONVENTIONAL_COMMITS_PATTERN = re.compile(
-    r'^(feat|fix|docs|style|refactor|test|chore)(\([\w-]+\))?: .+$'
+def _read_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+CONVENTIONAL_TYPES = (
+    "feat",
+    "fix",
+    "docs",
+    "style",
+    "refactor",
+    "test",
+    "chore",
+    "build",
+    "ci",
+    "perf",
+    "revert",
 )
+
+CONVENTIONAL_COMMITS_PATTERN = re.compile(
+    rf'^({"|".join(CONVENTIONAL_TYPES)})(\([\w./-]+\))?!?: .+$'
+)
+
+CONVENTIONAL_HEADER_PATTERN = re.compile(
+    rf'^({"|".join(CONVENTIONAL_TYPES)})(\([\w./-]+\))?(!)?: (.+)$',
+    re.IGNORECASE,
+)
+
+EMBEDDED_CONVENTIONAL_PATTERN = re.compile(
+    rf'({"|".join(CONVENTIONAL_TYPES)})(\([\w./-]+\))?!?: .+$',
+    re.IGNORECASE,
+)
+
+MESSAGE_PREFIX_PATTERN = re.compile(
+    r"^(commit message|message|commit)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+
+SUPPORTED_PROVIDERS = ("ollama", "gemini", "openai")
 
 # Ollama (default)
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -51,27 +94,69 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL_NAME", "gemini-2.0-flash")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL_NAME", "gpt-3.5-turbo-0125")
 
+MAX_DIFF_CHARS = _read_int_env("AICOMMIT_MAX_DIFF_CHARS", 14000)
 
 # ───────────────────────────────────────────────────────────────────────────────
 # CLI helpers
 # ───────────────────────────────────────────────────────────────────────────────
-def _has_flag(argv: List[str], flag: str) -> bool:
-    return any(a == flag or a.startswith(flag + "=") for a in argv)
-
-def _read_arg(argv: List[str], name: str, default: Optional[str] = None) -> Optional[str]:
-    if name in argv:
-        i = argv.index(name)
-        if i + 1 < len(argv):
-            return argv[i + 1]
-    for a in argv:
-        if a.startswith(name + "="):
-            return a.split("=", 1)[1]
-    return default
-
 def _log(msg: str, debug: bool):
     if debug:
         sys.stderr.write(f"[commit-gen] {msg}\n")
         sys.stderr.flush()
+
+
+def _error(msg: str) -> None:
+    sys.stderr.write(f"[commit-gen] {msg}\n")
+    sys.stderr.flush()
+
+
+def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate a Conventional Commit message from staged Git changes."
+    )
+    parser.add_argument(
+        "--provider",
+        choices=SUPPORTED_PROVIDERS,
+        default=None,
+        help="Force one provider instead of trying the default fallback chain.",
+    )
+    parser.add_argument(
+        "--language",
+        default="en",
+        help="Language for the generated commit subject (default: en).",
+    )
+    parser.add_argument(
+        "--allow-nonconventional",
+        action="store_true",
+        help="Allow responses that do not match Conventional Commits.",
+    )
+    parser.add_argument(
+        "--diff-per-file",
+        action="store_true",
+        help="Build prompt by concatenating per-file diffs.",
+    )
+    parser.add_argument(
+        "--max-diff-chars",
+        type=int,
+        default=MAX_DIFF_CHARS,
+        help=(
+            "Maximum staged diff size sent to the model. "
+            "Use 0 to disable truncation."
+        ),
+    )
+    parser.add_argument(
+        "--no-auto-stage",
+        dest="auto_stage",
+        action="store_false",
+        help="Do not run 'git add -u' before reading the staged diff.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logs to stderr.",
+    )
+    parser.set_defaults(auto_stage=True)
+    return parser.parse_args(argv)
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -157,19 +242,61 @@ def _openai_complete(model: str, api_key: str, system_prompt: str, user_prompt: 
     except Exception as e:
         return False, "", f"openai error: {e}"
 
-def _sanitize_first_line(text: str) -> str:
-    text = (text or "").strip()
-    if text.startswith("```"):
-        # drop code fences if any
-        parts = text.split("```")
-        text = "".join(parts[1:-1]) if len(parts) >= 3 else parts[-1]
-        text = text.strip()
-    # return first non-empty line only
-    for line in text.splitlines():
-        line = line.strip().strip('"').strip()
-        if line:
-            return line
+def _normalize_line(line: str) -> str:
+    out = line.strip().strip('"').strip("'").strip("`").strip()
+    out = re.sub(r"^[-*]\s+", "", out)
+    out = MESSAGE_PREFIX_PATTERN.sub("", out).strip()
+    out = re.sub(r"\s+", " ", out)
+    return out
+
+
+def _canonicalize_conventional(line: str) -> str:
+    match = CONVENTIONAL_HEADER_PATTERN.match(line)
+    if not match:
+        return line
+    commit_type, scope, breaking, subject = match.groups()
+    commit_type = commit_type.lower()
+    scope = scope or ""
+    breaking = breaking or ""
+    subject = subject.strip()
+    return f"{commit_type}{scope}{breaking}: {subject}"
+
+
+def _extract_message(text: str, allow_nonconv: bool) -> str:
+    candidates: List[str] = []
+    for raw_line in (text or "").splitlines():
+        stripped = raw_line.strip()
+        # Ignore markdown code-fence lines while keeping fenced content.
+        if stripped.startswith("```"):
+            continue
+        line = _normalize_line(raw_line)
+        if not line:
+            continue
+        candidates.append(line)
+        if CONVENTIONAL_COMMITS_PATTERN.match(line):
+            return _canonicalize_conventional(line)
+
+        embedded = EMBEDDED_CONVENTIONAL_PATTERN.search(line)
+        if embedded:
+            return _canonicalize_conventional(_normalize_line(embedded.group(0)))
+
+    if allow_nonconv and candidates:
+        return candidates[0]
     return ""
+
+def _trim_diff(diff: str, max_chars: int) -> Tuple[str, bool]:
+    if max_chars <= 0 or len(diff) <= max_chars:
+        return diff, False
+
+    marker = "\n\n# ... diff truncated for prompt size ...\n\n"
+    budget = max_chars - len(marker)
+    if budget <= 200:
+        return diff[:max_chars], True
+
+    head = budget // 2
+    tail = budget - head
+    trimmed = f"{diff[:head]}{marker}{diff[-tail:]}"
+    return trimmed, True
 
 
 def generate_commit_message(diff: str, language: str, force: Optional[str], debug: bool, allow_nonconv: bool) -> str:
@@ -194,30 +321,38 @@ def generate_commit_message(diff: str, language: str, force: Optional[str], debu
         if OPENAI_KEY and OPENAI_MODEL:
             order.append(Provider("openai", OPENAI_MODEL, api_key=OPENAI_KEY))
 
+    if not order:
+        raise RuntimeError("no providers configured")
+
     system_prompt = (
         "You are a commit message generator that strictly follows Conventional Commits format:\n"
-        "^(feat|fix|docs|style|refactor|test|chore)(\\([\\w-]+\\))?: .+$\n"
+        "^type(optional-scope): subject\n"
+        f"Allowed types: {', '.join(CONVENTIONAL_TYPES)}.\n"
         "Rules:\n"
-        "• Output ONLY the commit message, no code blocks or explanations.\n"
-        "• Use imperative mood; concise subject (≤ 72 chars ideally).\n"
-        f"• Write the message in language: {language}.\n"
-        "• If multiple changes, choose the best single type and optional scope.\n"
+        "- Output ONLY the commit message, no code blocks or explanations.\n"
+        "- Use imperative mood; concise subject (<= 72 chars ideally).\n"
+        f"- Write the message in language: {language}.\n"
+        "- If multiple changes, choose the best single type and optional scope.\n"
     )
+    user_prompt = f"Generate one commit message for this staged git diff:\n\n{diff}"
 
     errors: List[str] = []
     for p in order:
         _log(f"trying {p.name} ({p.model})", debug)
         ok, text, err = False, "", ""
         if p.name == "ollama":
-            ok, text, err = _ollama_chat(p.model, p.host, system_prompt, diff, debug)
+            ok, text, err = _ollama_chat(p.model, p.host, system_prompt, user_prompt, debug)
         elif p.name == "gemini":
-            ok, text, err = _gemini_complete(p.model, p.api_key, system_prompt, diff)
+            ok, text, err = _gemini_complete(p.model, p.api_key, system_prompt, user_prompt)
         elif p.name == "openai":
-            ok, text, err = _openai_complete(p.model, p.api_key, system_prompt, diff)
+            ok, text, err = _openai_complete(p.model, p.api_key, system_prompt, user_prompt)
 
         if err:
             _log(err, debug)
-        text = _sanitize_first_line(text)
+        if not ok and not text:
+            errors.append(f"{p.name}: {err or 'request failed'}")
+            continue
+        text = _extract_message(text, allow_nonconv)
 
         if not text:
             errors.append(f"{p.name}: empty")
@@ -235,31 +370,43 @@ def generate_commit_message(diff: str, language: str, force: Optional[str], debu
 # ───────────────────────────────────────────────────────────────────────────────
 # Git helpers
 # ───────────────────────────────────────────────────────────────────────────────
+def _run_git(args: Sequence[str], env: Optional[dict] = None) -> str:
+    cmd = ["git", *args]
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        errors="replace",
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout)
+    return result.stdout
+
+
 def is_git_repo() -> bool:
     try:
-        subprocess.check_output(["git", "rev-parse", "--is-inside-work-tree"], stderr=subprocess.STDOUT)
-        return True
+        out = _run_git(["rev-parse", "--is-inside-work-tree"]).strip()
+        return out == "true"
     except subprocess.CalledProcessError:
         return False
 
-def get_diff(diff_per_file: bool, debug: bool) -> str:
+def get_diff(diff_per_file: bool) -> str:
     try:
         env = {**os.environ, "GIT_PAGER": "cat"}
         if diff_per_file:
-            files = subprocess.check_output(
-                ["git", "diff", "--cached", "--name-only"], stderr=subprocess.STDOUT, text=True, env=env
-            ).splitlines()
+            files = _run_git(["diff", "--cached", "--name-only"], env=env).splitlines()
             chunks = []
             for f in files:
                 if not f:
                     continue
-                d = subprocess.check_output(
-                    ["git", "diff", "--cached", "--", f], stderr=subprocess.STDOUT, text=True, env=env
-                )
+                d = _run_git(["diff", "--cached", "--", f], env=env)
                 if d.strip():
                     chunks.append(d)
             return "\n".join(chunks)
-        return subprocess.check_output(["git", "diff", "--cached"], stderr=subprocess.STDOUT, text=True, env=env)
+        return _run_git(["diff", "--cached"], env=env)
     except subprocess.CalledProcessError:
         return ""
 
@@ -268,40 +415,55 @@ def get_diff(diff_per_file: bool, debug: bool) -> str:
 # Main
 # ───────────────────────────────────────────────────────────────────────────────
 def main() -> None:
-    debug = _has_flag(sys.argv, "--debug")
-    force = _read_arg(sys.argv, "--provider", None)  # ollama|gemini|openai
-    allow_nonconv = _has_flag(sys.argv, "--allow-nonconventional")
-    diff_per_file = _has_flag(sys.argv, "--diff-per-file")
-    language = _read_arg(sys.argv, "--language", "en") or "en"
+    args = parse_args(sys.argv[1:])
+
+    if args.max_diff_chars < 0:
+        _error("--max-diff-chars cannot be negative")
+        sys.exit(2)
 
     if not is_git_repo():
-        _log("not a git repo", debug)
+        _error("not a git repository")
         sys.exit(1)
 
-    try:
-        subprocess.check_output(["git", "add", "-u"], stderr=subprocess.STDOUT)
-    except subprocess.CalledProcessError as e:
-        _log(f"git add failed: {e}", debug)
-        sys.exit(1)
+    if args.auto_stage:
+        try:
+            _run_git(["add", "-u"])
+        except subprocess.CalledProcessError as e:
+            _error(f"git add -u failed: {(e.output or '').strip()}")
+            sys.exit(1)
 
-    diff = get_diff(diff_per_file, debug)
+    diff = get_diff(args.diff_per_file)
     if not diff.strip():
-        _log("no staged diff", debug)
+        _error("no staged diff")
         sys.exit(1)
 
+    diff, was_trimmed = _trim_diff(diff, args.max_diff_chars)
+    if was_trimmed:
+        _log(
+            f"staged diff was trimmed to {args.max_diff_chars} chars "
+            "for provider prompt stability",
+            args.debug,
+        )
+
     try:
-        msg = generate_commit_message(diff, language, force, debug, allow_nonconv)
+        msg = generate_commit_message(
+            diff,
+            args.language,
+            args.provider,
+            args.debug,
+            args.allow_nonconventional,
+        )
     except Exception as e:
-        _log(f"generation failed: {e}", True)
+        _error(f"generation failed: {e}")
         sys.exit(2)
 
-    msg = _sanitize_first_line(msg)
+    msg = _extract_message(msg, args.allow_nonconventional)
     if not msg:
-        _log("empty after sanitize", debug)
+        _error("empty message after sanitize")
         sys.exit(2)
 
-    if not allow_nonconv and not CONVENTIONAL_COMMITS_PATTERN.match(msg):
-        _log(f"not conventional: {msg!r}", debug)
+    if not args.allow_nonconventional and not CONVENTIONAL_COMMITS_PATTERN.match(msg):
+        _error(f"not conventional: {msg!r}")
         sys.exit(3)
 
     print(msg)
