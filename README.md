@@ -1,58 +1,147 @@
-# AI-Powered Commit Message Automation
+# aicommit
 
-Harness the power of AI to streamline your Git commit messages with this Python script. By leveraging both OpenAI's ChatGPT and Google's Generative AI, automate the crafting of insightful and standard-compliant commit messages. Dive into a solution that combines the best of AI technology to enhance your software development workflow.
+Generate a commit message from staged Git changes using AI providers with Conventional Commit validation.
 
-## Introduction
+## Features
 
-Crafting precise and insightful commit messages is crucial for efficient project management and seamless team collaboration. This guide introduces a Python-driven solution to automate commit message generation, integrating AI models from OpenAI and Google. Embrace flexibility and best practices in your development process.
+- Reads staged diff from `git diff --cached`.
+- Tries providers in fallback order: `ollama -> gemini -> openai` (unless forced).
+- Normalizes noisy model output (code fences, bullets, prefixes).
+- Enforces Conventional Commits by default.
+- Supports diff-size trimming for large changes to improve model reliability.
+- Prints only the commit subject to stdout, so it can be piped into `git commit -m`.
 
-## Problem Statement
+## Conventional Commit Support
 
-Manual composition of commit messages is time-consuming and monotonous. This solution aims to automate this process, delivering informative, standardized messages, and allowing developers to focus on coding.
+Default allowed types:
 
-## Solution Overview
+- `feat`
+- `fix`
+- `docs`
+- `style`
+- `refactor`
+- `test`
+- `chore`
+- `build`
+- `ci`
+- `perf`
+- `revert`
 
-The script provides an interface to OpenAI's ChatGPT and Google's Generative AI, selecting the best AI provider based on available credentials. It includes environment configuration, AI service initialization, and commit message generation following the Conventional Commits specification.
+Formats accepted:
 
-## Technical Details
+- `type: subject`
+- `type(scope): subject`
+- `type(scope)!: subject`
 
-```python
-# Python code snippet for API configuration and service initialization
-def get_api_configuration():
-    # Logic to determine which API keys and model names are configured
+## Requirements
 
-def configure_service(api_key, model_name):
-    # Setup for either OpenAI or Google Generative AI model
+- Python 3.9+
+- Git
+- At least one provider configured:
+  - Ollama running locally/remotely
+  - Gemini API key
+  - OpenAI API key
 
-def generate_commit_message(diff: str, language: str = "en"):
-    # Generates commit message using the configured AI service
-    # Detailed prompt crafting and AI model response handling
+Install dependencies:
 
-def validate_and_format_message(message: str):
-    # Validates the generated commit message against Conventional Commits
+```bash
+pip install -r requirements.txt
 ```
+
+## Configuration
+
+You can configure providers and behavior via environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `OLLAMA_HOST` | `http://127.0.0.1:11434` | Ollama server URL |
+| `OLLAMA_MODEL_NAME` | `gemma3n:e4b` | Ollama model name |
+| `GOOGLE_API_KEY` | _empty_ | Gemini API key |
+| `GEMINI_MODEL_NAME` | `gemini-2.0-flash` | Gemini model name |
+| `OPENAI_API_KEY` | _empty_ | OpenAI API key |
+| `OPENAI_MODEL_NAME` | `gpt-3.5-turbo-0125` | OpenAI model name |
+| `AICOMMIT_MAX_DIFF_CHARS` | `14000` | Max prompt diff chars (`0` disables truncation) |
 
 ## Usage
 
-To use this script set the API key your model, either `OPENAI_API_KEY` or `GOOGLE_API_KEY`  and save the file `~/.aicommit.py`, install the requirements with `pip install -r requirements` and then configure a Git alias as follows:
+Basic usage:
+
 ```bash
-git config --global alias.ai '!git commit -am "$(python ~/.aicommit.py)"'
+python3 aicommit.py
 ```
-Invoke with `git ai` to automatically generate and commit messages based on staged changes, ensuring consistency and adherence to best practices.
 
-## Benefits
+Use it directly in a commit:
 
-- **Time Efficiency**: Reduces effort in crafting commit messages.
-- **Consistency and Compliance**: Ensures uniform adherence to standards.
-- **Enhanced Project Log**: Provides a cleaner, more informative commit history.
+```bash
+git commit -m "$(python3 aicommit.py)"
+```
 
-## Customization and Exploration
+### CLI Flags
 
-This script encourages customization and exploration. Adapt it to fit team-specific guidelines or explore alternative AI models for improved outcomes.
+```text
+--provider {ollama,gemini,openai}
+--language LANGUAGE
+--allow-nonconventional
+--diff-per-file
+--max-diff-chars N
+--no-auto-stage
+--debug
+```
 
-## Collaboration Invitation
+### Examples
 
-Join the development of this AI-powered commit message generation solution. Share insights, contribute, and explore the potential of intelligent automation in software development.
+Force OpenAI:
 
-Embrace AI to optimize your development workflows, merging technology and creativity for efficient software development.
- 
+```bash
+python3 aicommit.py --provider openai
+```
+
+Generate in Spanish:
+
+```bash
+python3 aicommit.py --language es
+```
+
+Disable auto-staging tracked files:
+
+```bash
+python3 aicommit.py --no-auto-stage
+```
+
+Allow non-Conventional output:
+
+```bash
+python3 aicommit.py --allow-nonconventional
+```
+
+## Git Alias
+
+Create a message-only alias:
+
+```bash
+git config --global alias.aimsg '!python3 /absolute/path/to/aicommit.py'
+```
+
+Create an alias that commits with generated message:
+
+```bash
+git config --global alias.ai '!f(){ msg="$(python3 /absolute/path/to/aicommit.py)" || exit $?; git commit -m "$msg"; }; f'
+```
+
+## Exit Codes
+
+- `0`: success
+- `1`: Git context/staging error (not a repo, no staged diff, etc.)
+- `2`: generation/provider error
+- `3`: output failed Conventional Commit validation
+
+## Troubleshooting
+
+- `not a git repository`: run inside a Git worktree.
+- `no staged diff`: stage changes first, or rely on default auto-stage (`git add -u`).
+- `forced provider 'X' unavailable or misconfigured`: set that provider's API key/model.
+- `not conventional: ...`: rerun, or use `--allow-nonconventional` if intentional.
+
+## License
+
+[LICENSE](LICENSE)

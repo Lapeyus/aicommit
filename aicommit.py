@@ -5,18 +5,19 @@ import argparse
 import os
 import re
 import sys
-import json
 import subprocess
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from dotenv import load_dotenv
 
 # Optional providers
 try:
     import ollama as ollama_pkg  # type: ignore
+    OLLAMA_IMPORT_ERROR = ""
 except Exception:
     ollama_pkg = None  # type: ignore
+    OLLAMA_IMPORT_ERROR = str(sys.exc_info()[1] or "")
 
 try:
     import google.generativeai as genai  # type: ignore
@@ -25,11 +26,10 @@ except Exception:
 
 try:
     from openai import OpenAI  # type: ignore
+    OPENAI_IMPORT_ERROR = ""
 except Exception:
     OpenAI = None  # type: ignore
-
-from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
+    OPENAI_IMPORT_ERROR = str(sys.exc_info()[1] or "")
 
 load_dotenv()
 
@@ -169,47 +169,142 @@ class Provider:
     api_key: str = ""
     host: str = ""  # for ollama
 
-def _ollama_chat(model: str, host: str, system_prompt: str, user_prompt: str, debug: bool) -> Tuple[bool, str, str]:
+def _normalize_ollama_host(host: str) -> str:
+    value = (host or "").strip().rstrip("/")
+    if value.lower().endswith("/v1"):
+        value = value[:-3]
+    return value or "http://127.0.0.1:11434"
+
+
+def _extract_ollama_text(resp: Any) -> str:
+    # SDK returns pydantic models; older versions may return dicts.
+    if resp is None:
+        return ""
+    if isinstance(resp, dict):
+        return ((resp.get("message") or {}).get("content") or "").strip()
+    msg = getattr(resp, "message", None)
+    return (getattr(msg, "content", "") or "").strip()
+
+
+def _list_ollama_models(client: Any) -> List[str]:
     try:
-        # Prefer python client if present
-        if ollama_pkg is not None:
-            # Ensure host is used by the client
-            if host:
-                os.environ["OLLAMA_HOST"] = host
-            resp = ollama_pkg.chat(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                options={"temperature": 0.2, "num_predict": 128},
+        result = client.list()
+    except Exception:
+        return []
+    models = getattr(result, "models", None)
+    if models is None and isinstance(result, dict):
+        models = result.get("models")
+    out: List[str] = []
+    for item in models or []:
+        if isinstance(item, dict):
+            name = item.get("model") or item.get("name")
+        else:
+            name = getattr(item, "model", None) or getattr(item, "name", None)
+        if isinstance(name, str) and name.strip():
+            out.append(name.strip())
+    return out
+
+
+def _ollama_model_rank(name: str) -> Tuple[int, int]:
+    low = name.lower()
+    is_cloud = 1 if low.endswith(":cloud") else 0
+    preferred_bases = (
+        "gpt-oss",
+        "qwen",
+        "mistral",
+        "llama",
+        "gemma",
+        "phi",
+        "deepseek",
+        "codellama",
+    )
+    pref_index = len(preferred_bases)
+    for idx, base in enumerate(preferred_bases):
+        if low.startswith(base):
+            pref_index = idx
+            break
+    return (is_cloud, pref_index)
+
+
+def _build_ollama_candidates(requested: str, installed: List[str]) -> List[str]:
+    if not installed:
+        return [requested] if requested else []
+
+    ordered: List[str] = []
+
+    def add(name: str) -> None:
+        if name and name not in ordered:
+            ordered.append(name)
+
+    req = (requested or "").strip()
+    add(req)
+
+    # Same base tags first (if the requested base exists locally).
+    req_base = req.split(":", 1)[0] if req else ""
+    if req_base:
+        for name in installed:
+            if name.split(":", 1)[0] == req_base:
+                add(name)
+
+    # Then fall back to best locally installed models.
+    indexed = list(enumerate(installed))
+    indexed.sort(key=lambda pair: (_ollama_model_rank(pair[1]), pair[0]))
+    for _, name in indexed:
+        add(name)
+
+    return ordered
+
+
+def _ollama_chat(model: str, host: str, system_prompt: str, user_prompt: str, debug: bool) -> Tuple[bool, str, str]:
+    if ollama_pkg is None:
+        detail = OLLAMA_IMPORT_ERROR or "import failed"
+        return False, "", f"ollama sdk missing: {detail}"
+
+    host = _normalize_ollama_host(host)
+    client = ollama_pkg.Client(host=host)
+    options = {"temperature": 0.2, "num_predict": 128}
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    installed = _list_ollama_models(client)
+    candidates = _build_ollama_candidates(model, installed)
+    if not candidates:
+        candidates = [model]
+
+    errors: List[str] = []
+    response_error = getattr(ollama_pkg, "ResponseError", None)
+    for index, candidate in enumerate(candidates):
+        if index > 0:
+            _log(f"ollama retry with model '{candidate}'", debug)
+        try:
+            resp = client.chat(
+                model=candidate,
+                messages=messages,
+                options=options,
             )
-            content = (resp.get("message") or {}).get("content", "")
-            return True, (content or "").strip(), ""
-        # Raw HTTP fallback
-        payload = {
-            "model": model,
-            "stream": False,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "options": {"temperature": 0.2, "num_predict": 128},
-        }
-        req = Request(
-            f"{host.rstrip('/')}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlopen(req, timeout=60) as r:
-            data = json.loads(r.read().decode("utf-8") or "{}")
-        text = (data.get("message") or {}).get("content", "")
-        return True, (text or "").strip(), ""
-    except (URLError, HTTPError) as e:
-        return False, "", f"ollama network error: {e}"
-    except Exception as e:
-        return False, "", f"ollama error: {e}"
+            text = _extract_ollama_text(resp)
+            if text:
+                if candidate != model:
+                    _log(
+                        f"ollama model '{model}' unavailable/empty; using '{candidate}'",
+                        debug,
+                    )
+                return True, text, ""
+            errors.append(f"{candidate}: empty")
+        except Exception as e:
+            if response_error is not None and isinstance(e, response_error):
+                status = getattr(e, "status_code", None)
+                if status == 404:
+                    errors.append(f"{candidate}: not found")
+                    continue
+                errors.append(f"{candidate}: {e}")
+                continue
+            errors.append(f"{candidate}: {e}")
+
+    hint = ", ".join(installed[:5]) if installed else "no installed models found"
+    summary = "; ".join(errors[:4]) if errors else "no successful response"
+    return False, "", f"ollama failed (host={host}): {summary}. installed: {hint}"
 
 def _gemini_complete(model: str, api_key: str, system_prompt: str, user_prompt: str) -> Tuple[bool, str, str]:
     try:
@@ -225,7 +320,8 @@ def _gemini_complete(model: str, api_key: str, system_prompt: str, user_prompt: 
 def _openai_complete(model: str, api_key: str, system_prompt: str, user_prompt: str) -> Tuple[bool, str, str]:
     try:
         if OpenAI is None:
-            return False, "", "openai sdk missing"
+            detail = OPENAI_IMPORT_ERROR or "import failed"
+            return False, "", f"openai sdk missing: {detail}"
         client = OpenAI(api_key=api_key)  # type: ignore
         out = client.chat.completions.create(
             model=model,
@@ -243,7 +339,7 @@ def _openai_complete(model: str, api_key: str, system_prompt: str, user_prompt: 
         return False, "", f"openai error: {e}"
 
 def _normalize_line(line: str) -> str:
-    out = line.strip().strip('"').strip("'").strip("`").strip()
+    out = line.strip().strip('"').strip("'").strip("`").strip("*").strip()
     out = re.sub(r"^[-*]\s+", "", out)
     out = MESSAGE_PREFIX_PATTERN.sub("", out).strip()
     out = re.sub(r"\s+", " ", out)
